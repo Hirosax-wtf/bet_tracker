@@ -59,12 +59,13 @@ st.subheader("🏆 Top performers")
 
 @st.cache_data(ttl=60)
 def _top_users() -> list[dict]:
-    return leaderboard(db, min_bets=LEADERBOARD_MIN_BETS)[:5]
+    # Show users with any bets on homepage; full leaderboard page uses stricter minimum
+    return leaderboard(db, min_bets=1)[:5]
 
 rows = _top_users()
 if not rows:
     st.info(
-        f"No public users with at least {LEADERBOARD_MIN_BETS} bets yet — "
+        "No users with logged bets yet — "
         "log bets to be the first on the leaderboard."
     )
 else:
