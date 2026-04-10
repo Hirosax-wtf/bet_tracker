@@ -740,6 +740,14 @@ def build_app() -> Application:
 
 
 def main() -> None:
+    # Python 3.14 removed implicit loop creation in asyncio.get_event_loop().
+    # python-telegram-bot 21.4's run_polling() still calls get_event_loop()
+    # internally, so we create and install one before it does.
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     app = build_app()
     log.info("Bet Tracker bot starting (polling)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
