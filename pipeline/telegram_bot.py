@@ -75,7 +75,10 @@ log = logging.getLogger("bet_tracker.bot")
     BET_NICHE,
     BET_INJURY,
     BET_NOTES,
-) = range(14)
+    SLIP_CONFIRM,
+    SLIP_PROB,
+    SLIP_STAKE,
+) = range(17)
 
 
 # ---------------------------------------------------------------------------
@@ -147,10 +150,11 @@ async def set_username(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 # /bet — guided + shorthand
 # ---------------------------------------------------------------------------
 SHORTHAND_HELP = (
-    "3 ways to log a bet:\n\n"
+    "4 ways to log a bet:\n\n"
     "1️⃣ /bet (guided — step by step)\n"
     "2️⃣ /bet NBA \"GSW vs LAL\" Curry pts over 26.5 DK -120 62 25 totals\n"
-    "3️⃣ /template → fill & send back\n\n"
+    "3️⃣ /template → fill & send back\n"
+    "4️⃣ /slip → paste a bet slip from DK/FD/Fanatics/MGM\n\n"
     "Tip: /bet last — reuses last bet's game/book/niche"
 )
 
@@ -810,6 +814,189 @@ async def cmd_group(update, ctx):
 
 
 # ---------------------------------------------------------------------------
+# /slip — paste a sportsbook bet slip
+# ---------------------------------------------------------------------------
+SLIP_HELP = (
+    "📋 Paste a bet slip from DraftKings, FanDuel, Fanatics, or BetMGM.\n\n"
+    "Example — just copy from your sportsbook app and paste:\n"
+    "```\n"
+    "/slip\n"
+    "Jalen Brunson\n"
+    "Over 24.5 Points\n"
+    "-110\n"
+    "```\n"
+    "I'll parse it and ask you to confirm before logging."
+)
+
+
+async def cmd_slip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = _ensure_user_or_prompt(update)
+    if not user:
+        await update.message.reply_text("Run /start first.")
+        return ConversationHandler.END
+
+    text = update.message.text or ""
+    # Strip the /slip command prefix
+    body = text.split(None, 1)[1] if " " in text or "\n" in text else ""
+    # If /slip was on its own line, grab everything after it
+    if not body and "\n" in text:
+        body = text.split("\n", 1)[1]
+
+    if not body.strip():
+        await update.message.reply_text(SLIP_HELP, parse_mode="Markdown")
+        await update.message.reply_text(
+            "Paste your bet slip now (or /cancel to abort):"
+        )
+        return SLIP_CONFIRM
+
+    # Text was included with the command
+    return await _process_slip_text(update, ctx, body, user)
+
+
+async def slip_receive_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive the pasted slip text after a bare /slip."""
+    user = _ensure_user_or_prompt(update)
+    if not user:
+        return ConversationHandler.END
+    text = update.message.text or ""
+    return await _process_slip_text(update, ctx, text, user)
+
+
+async def _process_slip_text(update, ctx, text, user) -> int:
+    from pipeline.slip_parser import parse_slip, format_confirmation
+
+    legs = parse_slip(text)
+    if not legs:
+        await update.message.reply_text(
+            "⚠️ Couldn't parse any bets from that text.\n\n"
+            "Try the shorthand instead:\n"
+            "/bet NBA \"GSW vs LAL\" Brunson pts over 24.5 DK -110 62 25 role_expansion"
+        )
+        return ConversationHandler.END
+
+    ctx.user_data["slip_legs"] = legs
+    ctx.user_data["slip_current"] = 0
+
+    msg = format_confirmation(legs, parlay=len(legs) > 1)
+    await update.message.reply_text(msg)
+    return SLIP_CONFIRM
+
+
+async def slip_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle Yes/Edit/Cancel after showing parsed slip."""
+    text = (update.message.text or "").strip().lower()
+    legs = ctx.user_data.get("slip_legs")
+
+    if not legs:
+        # They pasted text after bare /slip — try to parse it
+        return await slip_receive_text(update, ctx)
+
+    if text in ("yes", "y", "✅", "confirm", "ok", "log"):
+        # Need prob and stake before logging — ask for both
+        await update.message.reply_text(
+            "What's your probability estimate? (0-100)\n"
+            "(This is YOUR confidence the bet hits)"
+        )
+        return SLIP_PROB
+
+    if text in ("cancel", "no", "n", "❌", "abort"):
+        ctx.user_data.pop("slip_legs", None)
+        await update.message.reply_text("Cancelled.")
+        return ConversationHandler.END
+
+    if text in ("edit", "✏️", "e"):
+        legs_data = ctx.user_data.get("slip_legs", [])
+        if legs_data:
+            # Show as a pre-filled template they can edit
+            leg = legs_data[0]
+            tmpl = (
+                "📝 Edit and send back:\n\n"
+                "```\n"
+                "/bet\n"
+                f"Sport: NBA\n"
+                f"Game: ?\n"
+                f"Player: {leg.get('player', '?')}\n"
+                f"Prop: {leg.get('prop_type', 'points')}\n"
+                f"Line: {leg.get('line', '?')}\n"
+                f"Dir: {leg.get('direction', 'over')}\n"
+                f"Book: {leg.get('book', '?')}\n"
+                f"Odds: {leg.get('odds', '?')}\n"
+                f"Prob: \n"
+                f"Stake: \n"
+                f"Niche: \n"
+                "```"
+            )
+            ctx.user_data.pop("slip_legs", None)
+            await update.message.reply_text(tmpl, parse_mode="Markdown")
+            return ConversationHandler.END
+        await update.message.reply_text("Nothing to edit. Send a new /slip.")
+        return ConversationHandler.END
+
+    # Unrecognized response — might be paste text after bare /slip
+    return await slip_receive_text(update, ctx)
+
+
+async def slip_prob(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        prob = float(update.message.text.strip())
+        if not (0 < prob <= 100):
+            raise ValueError
+    except (ValueError, TypeError):
+        await update.message.reply_text("⚠️ Enter a number between 1-100:")
+        return SLIP_PROB
+    ctx.user_data["slip_prob"] = prob
+    await update.message.reply_text("Stake amount ($)?")
+    return SLIP_STAKE
+
+
+async def slip_stake(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        stake = float(update.message.text.strip().replace("$", "").replace(",", ""))
+        if stake <= 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        await update.message.reply_text("⚠️ Enter a positive dollar amount:")
+        return SLIP_STAKE
+
+    user = _ensure_user_or_prompt(update)
+    if not user:
+        return ConversationHandler.END
+
+    prob = ctx.user_data.get("slip_prob", 50)
+    legs = ctx.user_data.get("slip_legs", [])
+
+    msgs = []
+    for leg in legs:
+        bet = {
+            "sport": "NBA",  # default, user can fix via /close
+            "game": "?",
+            "game_date": date.today().isoformat(),
+            "player": leg.get("player"),
+            "prop_type": leg.get("prop_type"),
+            "line": leg.get("line"),
+            "direction": leg.get("direction"),
+            "book": leg.get("book", "?"),
+            "odds": leg.get("odds") or -110,
+            "your_prob": prob,
+            "stake": stake,
+            "niche": None,
+            "injury_context": None,
+            "notes": "logged via /slip",
+        }
+        bet_id, summary = _save_bet(user, bet)
+        awards = check_and_award(db, user["user_id"], "log")
+        if awards:
+            summary += "\n\n" + format_award_message(awards)
+        msgs.append(summary)
+
+    push_async(db)
+    await update.message.reply_text("\n\n".join(msgs))
+    ctx.user_data.pop("slip_legs", None)
+    ctx.user_data.pop("slip_prob", None)
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
 # /template
 # ---------------------------------------------------------------------------
 async def cmd_template(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -863,8 +1050,19 @@ def build_app() -> Application:
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
+    slip_conv = ConversationHandler(
+        entry_points=[CommandHandler("slip", cmd_slip)],
+        states={
+            SLIP_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, slip_confirm)],
+            SLIP_PROB:    [MessageHandler(filters.TEXT & ~filters.COMMAND, slip_prob)],
+            SLIP_STAKE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, slip_stake)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+    )
+
     app.add_handler(start_conv)
     app.add_handler(bet_conv)
+    app.add_handler(slip_conv)
     app.add_handler(CommandHandler("close", cmd_close))
     app.add_handler(CommandHandler("closing", cmd_closing))
     app.add_handler(CommandHandler("pending", cmd_pending))
