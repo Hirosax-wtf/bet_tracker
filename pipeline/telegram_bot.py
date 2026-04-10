@@ -147,10 +147,45 @@ async def set_username(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 # /bet — guided + shorthand
 # ---------------------------------------------------------------------------
 SHORTHAND_HELP = (
-    "Shorthand: /bet <sport> \"<game>\" <player> <prop> <over|under> "
-    "<line> <book> <odds> <yourprob> <stake> <niche>\n"
-    "Example: /bet NBA \"GSW vs LAL\" Walker reb over 6.5 DK -175 80 25 role_expansion"
+    "3 ways to log a bet:\n\n"
+    "1️⃣ /bet (guided — step by step)\n"
+    "2️⃣ /bet NBA \"GSW vs LAL\" Curry pts over 26.5 DK -120 62 25 totals\n"
+    "3️⃣ /template → fill & send back\n\n"
+    "Tip: /bet last — reuses last bet's game/book/niche"
 )
+
+TEMPLATE_MSG = (
+    "📝 Copy this, fill it in, and send it back:\n\n"
+    "```\n"
+    "/bet\n"
+    "Sport: NBA\n"
+    "Game: GSW vs LAL\n"
+    "Player: Curry\n"
+    "Prop: points\n"
+    "Line: 26.5\n"
+    "Dir: over\n"
+    "Book: DK\n"
+    "Odds: -120\n"
+    "Prob: 62\n"
+    "Stake: 25\n"
+    "Niche: totals\n"
+    "Injury: skip\n"
+    "Notes: skip\n"
+    "```\n\n"
+    "Fields are labeled so you can fill them in any order. "
+    "'Injury' and 'Notes' are optional — leave as 'skip' or delete the line."
+)
+
+# Recognized labels for multi-line template parsing
+_TEMPLATE_KEYS = {
+    "sport": "sport", "game": "game", "player": "player",
+    "prop": "prop_type", "type": "prop_type", "prop_type": "prop_type",
+    "line": "line", "dir": "direction", "direction": "direction",
+    "over/under": "direction", "book": "book", "odds": "odds",
+    "prob": "your_prob", "your_prob": "your_prob", "probability": "your_prob",
+    "stake": "stake", "niche": "niche", "injury": "injury_context",
+    "injury_context": "injury_context", "notes": "notes",
+}
 
 
 async def cmd_bet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -159,11 +194,57 @@ async def cmd_bet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Run /start first to create your profile.")
         return ConversationHandler.END
 
+    text = update.message.text or ""
     args = ctx.args or []
-    # Shorthand mode
+
+    # --- "last" shortcut: reuse last bet's game/book/niche context ------
+    if args and args[0].lower() == "last":
+        last = db.fetch_one(
+            "SELECT * FROM bets WHERE user_id=? ORDER BY created_at DESC LIMIT 1",
+            (user["user_id"],),
+        )
+        if not last:
+            await update.message.reply_text("No previous bet to reuse.")
+            return ConversationHandler.END
+        pre = (
+            "📝 Fill from last bet — change what you need:\n\n"
+            f"```\n"
+            f"/bet\n"
+            f"Sport: {last['sport']}\n"
+            f"Game: {last['game']}\n"
+            f"Player: {last['player'] or 'game'}\n"
+            f"Prop: {last['prop_type'] or 'points'}\n"
+            f"Line: {last['line']}\n"
+            f"Dir: {last['direction']}\n"
+            f"Book: {last['book']}\n"
+            f"Odds: {last['odds']}\n"
+            f"Prob: \n"
+            f"Stake: {last['stake']}\n"
+            f"Niche: {last['niche'] or 'other'}\n"
+            f"```\n"
+            "Copy, fill in Prob (and adjust anything else), send it back."
+        )
+        await update.message.reply_text(pre, parse_mode="Markdown")
+        return ConversationHandler.END
+
+    # --- Multi-line template format (has ":" labeled fields) ------------
+    if "\n" in text and ":" in text:
+        try:
+            bet = _parse_template(text)
+            bet_id, msg = _save_bet(user, bet)
+            awards = check_and_award(db, user["user_id"], "log")
+            if awards:
+                msg += "\n\n" + format_award_message(awards)
+            push_async(db)
+            await update.message.reply_text(msg)
+            return ConversationHandler.END
+        except ValueError:
+            pass  # Fall through to shorthand / guided
+
+    # --- Shorthand (single-line positional args) ------------------------
     if args:
         try:
-            bet = _parse_shorthand(update.message.text)
+            bet = _parse_shorthand(text)
         except ValueError as e:
             await update.message.reply_text(f"⚠️ {e}\n\n{SHORTHAND_HELP}")
             return ConversationHandler.END
@@ -175,12 +256,65 @@ async def cmd_bet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(msg)
         return ConversationHandler.END
 
-    # Guided mode
+    # --- Guided mode (no args) ------------------------------------------
     ctx.user_data["bet"] = {}
     await update.message.reply_text(
-        "Sport? (NBA / MLB / NFL / NHL / other)\n(send /cancel to abort)"
+        "Sport? (NBA / MLB / NFL / NHL / other)\n"
+        "(send /cancel to abort, or try /template for a fill-in form)"
     )
     return BET_SPORT
+
+
+def _parse_template(text: str) -> dict:
+    """Parse a multi-line labeled template message.
+
+    Example input:
+        /bet
+        Sport: NBA
+        Game: GSW vs LAL
+        Player: Curry
+        ...
+    Labels are case-insensitive and flexible (Prop/Type/prop_type all work).
+    """
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("/bet"):
+            continue
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key = key.strip().lower().replace(" ", "_")
+        val = val.strip()
+        mapped = _TEMPLATE_KEYS.get(key)
+        if mapped and val:
+            fields[mapped] = val
+
+    required = {"sport", "game", "book", "odds", "your_prob", "stake"}
+    missing = required - set(fields.keys())
+    if missing:
+        raise ValueError(f"Missing required fields: {', '.join(sorted(missing))}")
+
+    injury = fields.get("injury_context")
+    notes = fields.get("notes")
+    player = fields.get("player")
+
+    return {
+        "sport": fields["sport"].upper(),
+        "game": fields["game"],
+        "player": None if (not player or player.lower() in ("game", "skip", "-")) else player,
+        "prop_type": fields.get("prop_type", "points"),
+        "direction": fields.get("direction", "over").lower(),
+        "line": float(fields.get("line", "0")),
+        "book": fields["book"],
+        "odds": int(fields["odds"].replace("+", "")),
+        "your_prob": float(fields["your_prob"]),
+        "stake": float(fields["stake"].replace("$", "")),
+        "niche": fields.get("niche", "other"),
+        "injury_context": None if (not injury or injury.lower() == "skip") else injury,
+        "notes": None if (not notes or notes.lower() == "skip") else notes,
+        "game_date": date.today().isoformat(),
+    }
 
 
 def _parse_shorthand(text: str) -> dict:
@@ -676,6 +810,13 @@ async def cmd_group(update, ctx):
 
 
 # ---------------------------------------------------------------------------
+# /template
+# ---------------------------------------------------------------------------
+async def cmd_template(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(TEMPLATE_MSG, parse_mode="Markdown")
+
+
+# ---------------------------------------------------------------------------
 # /cancel
 # ---------------------------------------------------------------------------
 async def cmd_cancel(update, ctx):
@@ -734,6 +875,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
     app.add_handler(CommandHandler("kelly", cmd_kelly))
     app.add_handler(CommandHandler("group", cmd_group))
+    app.add_handler(CommandHandler("template", cmd_template))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     return app
