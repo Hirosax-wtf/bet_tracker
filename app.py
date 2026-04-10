@@ -57,7 +57,6 @@ with col2:
 st.divider()
 st.subheader("🏆 Top performers")
 
-@st.cache_data(ttl=60)
 def _top_users() -> list[dict]:
     # Show users with any bets on homepage; full leaderboard page uses stricter minimum
     return leaderboard(db, min_bets=1)[:5]
