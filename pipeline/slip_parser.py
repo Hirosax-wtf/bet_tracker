@@ -569,61 +569,131 @@ def _try_mgm(text: str) -> Optional[list[dict]]:
 
 def _try_generic(text: str) -> Optional[list[dict]]:
     """
-    Last resort: scan for any line containing over/under + a number,
-    with a name on the same or preceding line.
+    Flexible last-resort parser for freeform pasted text.
+
+    Catches all common formats users paste from screenshots:
+      "Brunson 25+ pts"
+      "Brunson over 24.5 points"
+      "Brunson Over 24.5 Pts (-110)"
+      "Jalen Brunson - Over 24.5 Points"
+      "KAT 10+ reb"
+      "Maxey o4.5 ast"
+      "Warriors ML"
+      "Warriors moneyline"
+      "GSW -3.5"
+
+    Odds are optional — most screenshot pastes don't include them.
     """
     lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
     legs = []
 
-    # Pattern: anything with "over/under X.X" somewhere
-    ou_re = re.compile(r"(over|under)\s+(\d+\.?\d*)", re.IGNORECASE)
-    # Odds pattern: standalone American odds
+    # Skip lines that are clearly boilerplate
+    skip_re = re.compile(
+        r"(?:^(?:same game parlay|sgp|total wager|wager|payout|potential|"
+        r"my bets|all sports|casino|must be 21|gambling|call 1-800|"
+        r"draftkings|fanduel|fanatics|betmgm|bovada|espn bet|"
+        r"placed|open|settled|won|lost|void|share|bet slip|receipt))",
+        re.IGNORECASE,
+    )
+    time_re = re.compile(r"^\d{1,2}:\d{2}\s*(?:AM|PM)", re.IGNORECASE)
+    money_re = re.compile(r"^\$[\d,.]+$")
+
+    # Odds pattern
     odds_re = re.compile(r"([+-−–]\d{3,})")
 
+    # Pattern 1: "Player N+ PropType" — e.g. "Brunson 25+ pts", "KAT 10+ reb"
+    nplus_re = re.compile(
+        r"^(.+?)\s+(\d+\.?\d*)\+\s*(.+?)(?:\s*\(([+-−–]?\d+)\))?$",
+    )
+
+    # Pattern 2: "Player over/under N.N PropType" — e.g. "Maxey over 4.5 ast"
+    # Also handles "Player - Over 24.5 Points" and "Player o4.5 ast"
+    ou_re = re.compile(
+        r"^(.+?)\s*[-–—]?\s*(?:(over|under|o|u)\s*(\d+\.?\d*)\s*(.+?))(?:\s*\(([+-−–]?\d+)\))?$",
+        re.IGNORECASE,
+    )
+
+    # Pattern 3: "Team ML" or "Team moneyline" or "Team -3.5"
+    ml_re = re.compile(
+        r"^(.+?)\s+(?:ML|moneyline)(?:\s*\(([+-−–]?\d+)\))?$",
+        re.IGNORECASE,
+    )
+    spread_re = re.compile(
+        r"^(.+?)\s+([+-]\d+\.?\d*)(?:\s*\(([+-−–]?\d+)\))?$",
+    )
+
     for i, line in enumerate(lines):
-        m = ou_re.search(line)
-        if not m:
+        # Skip boilerplate
+        if skip_re.match(line) or time_re.match(line) or money_re.match(line):
+            continue
+        # Skip standalone odds lines
+        if re.match(r"^[+-−–]?\d+$", line):
+            continue
+        # Skip ALL-CAPS label lines (e.g. "TATSUYA IMAI - ALT STRIKEOUTS")
+        if line == line.upper() and len(line) > 10 and "-" in line:
             continue
 
-        direction = _parse_direction(m.group(1))
-        line_val = float(m.group(2))
-
-        # Try to extract player name: text before "over/under"
-        before = line[:m.start()].strip().rstrip("-–— :").strip()
-        # If before is empty, check previous line
-        if not before and i > 0:
-            before = lines[i - 1].strip()
-        # Skip if "before" looks like odds or a number
-        if before and re.match(r"^[+-−]?\d+$", before):
-            before = ""
-
-        # Try to extract prop type: text after the number
-        after = line[m.end():].strip()
-        prop = _normalize_prop(after) if after else "points"
-
-        # Scan for odds in this line or the next
-        odds = None
-        om = odds_re.search(line[m.end():])
-        if om:
-            odds = _parse_odds(om.group(1))
-        elif i + 1 < len(lines):
-            om2 = odds_re.search(lines[i + 1])
-            if om2:
-                odds = _parse_odds(om2.group(1))
-        # Also check for parenthesized odds
-        paren = re.search(r"\(([+-−–]?\d+)\)", line)
-        if paren and odds is None:
-            odds = _parse_odds(paren.group(1))
-
-        if before:
+        # Try N+ format first: "Brunson 25+ pts"
+        m = nplus_re.match(line)
+        if m:
             legs.append({
-                "player": before,
-                "direction": direction,
-                "line": line_val,
-                "prop_type": prop,
-                "odds": odds,
+                "player": m.group(1).strip(),
+                "direction": "over",
+                "line": float(m.group(2)),
+                "prop_type": _normalize_prop(m.group(3)),
+                "odds": _parse_odds(m.group(4)) if m.group(4) else None,
                 "book": "unknown",
             })
+            continue
+
+        # Try over/under format: "Maxey over 4.5 ast"
+        m = ou_re.match(line)
+        if m:
+            player = m.group(1).strip().rstrip("-–— :")
+            dir_str = m.group(2)
+            line_val = float(m.group(3))
+            prop_raw = m.group(4).strip()
+            # Clean trailing odds from prop: "Points (-110)" → "Points"
+            prop_raw = re.sub(r"\s*\([+-−–]?\d+\)\s*$", "", prop_raw)
+            prop = _normalize_prop(prop_raw) if prop_raw else "points"
+            odds = _parse_odds(m.group(5)) if m.group(5) else None
+
+            if player and not re.match(r"^[+-−]?\d+$", player):
+                legs.append({
+                    "player": player,
+                    "direction": _parse_direction(dir_str),
+                    "line": line_val,
+                    "prop_type": prop,
+                    "odds": odds,
+                    "book": "unknown",
+                })
+                continue
+
+        # Try moneyline: "Warriors ML"
+        m = ml_re.match(line)
+        if m:
+            legs.append({
+                "player": m.group(1).strip(),
+                "direction": "moneyline",
+                "line": 0,
+                "prop_type": "moneyline",
+                "odds": _parse_odds(m.group(2)) if m.group(2) else None,
+                "book": "unknown",
+            })
+            continue
+
+        # Try spread: "GSW -3.5"
+        m = spread_re.match(line)
+        if m and not re.match(r"^\d", m.group(1)):  # name shouldn't start with digit
+            legs.append({
+                "player": m.group(1).strip(),
+                "direction": "spread",
+                "line": float(m.group(2)),
+                "prop_type": "spread",
+                "odds": _parse_odds(m.group(3)) if m.group(3) else None,
+                "book": "unknown",
+            })
+            continue
 
     return legs if legs else None
 
@@ -683,12 +753,16 @@ def parse_slip(text: str) -> list[dict]:
         result = fn(text)
         if result:
             # Override book if we detected one from the text
+            book = detected_book or result[0].get("book", "unknown")
             if detected_book:
                 for leg in result:
                     leg["book"] = detected_book
+            # Merge in any legs the book-specific parser missed
+            # (e.g. ML lines, spreads mixed with props)
+            result = _merge_generic_extras(result, text, book)
             return result
 
-    # Generic fallback
+    # Generic fallback — always run to catch lines other parsers missed
     result = _try_generic(text)
     if result:
         if detected_book:
@@ -697,6 +771,27 @@ def parse_slip(text: str) -> list[dict]:
         return result
 
     return []
+
+
+def _merge_generic_extras(primary: list[dict], text: str, book: str) -> list[dict]:
+    """Run generic parser and merge in any legs the primary parser missed."""
+    generic = _try_generic(text)
+    if not generic:
+        return primary
+
+    # Build set of players already parsed (lowercase for matching)
+    existing_players = {leg["player"].lower().strip() for leg in primary}
+
+    extras = []
+    for leg in generic:
+        player_low = leg["player"].lower().strip()
+        # Only add if this player isn't already in primary results
+        if player_low not in existing_players:
+            leg["book"] = book
+            extras.append(leg)
+            existing_players.add(player_low)
+
+    return primary + extras
 
 
 def format_confirmation(legs: list[dict], parlay: bool = False) -> str:
