@@ -195,33 +195,140 @@ def _try_dk(text: str) -> Optional[list[dict]]:
 
 # ── FanDuel ────────────────────────────────────────────────────────
 
-# FD paste format:
-#   Jalen Brunson Over 24.5 Points (-110)
-#   or
-#   Jalen Brunson
-#   Over 24.5 Points
-#   (-110)
+# FD paste formats:
+#
+# Format 1 (inline): "Jalen Brunson Over 24.5 Points (-110)"
+#
+# Format 2 (SGP from app):
+#   SGP
+#   Same Game Parlay™
+#   Houston Astros (T Imai) @ Seattle Mariners (E Hancock)
+#   +169
+#   9:41PM ET
+#   Houston Astros          ← moneyline leg
+#   MONEYLINE
+#   Tatsuya Imai 5+ Strikeouts    ← prop leg (N+ format)
+#   TATSUYA IMAI - ALT STRIKEOUTS ← label (skip)
+
+_FD_SKIP_CI = re.compile(
+    r"(?:^sgp$|same game parlay|total wager|^home$|all sports|my bets|casino)",
+    re.IGNORECASE,
+)
+_FD_SKIP_CS = re.compile(
+    r"(?:^\$[\d,.]+$|^[A-Z][A-Z\s-]{4,}$)"  # ALL-CAPS labels only (case-sensitive)
+)
+
+def _fd_skip(line: str) -> bool:
+    return bool(_FD_SKIP_CI.match(line) or _FD_SKIP_CS.match(line))
+
+# "Player N+ PropType" — e.g. "Tatsuya Imai 5+ Strikeouts"
+_FD_PROP_LEG_RE = re.compile(
+    r"^(.+?)\s+(\d+\.?\d*)\+\s+(.+)$",
+)
+
+# "Player Over/Under N.N PropType" — e.g. "Brunson Over 24.5 Points"
+_FD_OU_LEG_RE = re.compile(
+    r"^(.+?)\s+(over|under)\s+(\d+\.?\d*)\s+(.+?)(?:\s*\(([+-−–]?\d+)\))?$",
+    re.IGNORECASE,
+)
+
+# Game line: "Team (Pitcher) @ Team (Pitcher)" or "Team @ Team"
+_FD_GAME_RE = re.compile(
+    r"^(.+?)\s+(?:@|vs\.?)\s+(.+)$",
+    re.IGNORECASE,
+)
+
+# SGP odds: "+169" or "-134"
+_FD_SGP_ODDS_RE = re.compile(r"^[+-−–]\d{2,}$")
+
+# Time: "9:41PM ET"
+_FD_TIME_RE = re.compile(r"^\d{1,2}:\d{2}\s*(?:AM|PM)\s*ET", re.IGNORECASE)
+
 
 def _try_fd(text: str) -> Optional[list[dict]]:
     lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
-    legs = []
+    if not lines:
+        return None
 
-    # Single-line format: "Player Over/Under X.X PropType (odds)"
-    single_re = re.compile(
-        r"^(.+?)\s+(over|under)\s+(\d+\.?\d*)\s+(.+?)\s*\(([+-−–]?\d+)\)",
-        re.IGNORECASE,
-    )
-    for line in lines:
-        m = single_re.match(line)
-        if m:
+    legs = []
+    current_odds = None
+    current_game = None
+    sgp_group = 0  # increments on each new SGP block
+
+    for i, line in enumerate(lines):
+        # New SGP block
+        if line.strip().upper() == "SGP" or "same game parlay" in line.lower():
+            sgp_group += 1
+            continue
+
+        # Skip boilerplate
+        if _FD_TIME_RE.match(line):
+            continue
+        if _fd_skip(line):
+            continue
+
+        # SGP odds line
+        if _FD_SGP_ODDS_RE.match(line):
+            current_odds = _parse_odds(line)
+            if sgp_group == 0:
+                sgp_group = 1
+            continue
+
+        # Game line — extract for context
+        game_m = _FD_GAME_RE.match(line)
+        if game_m and "+" not in line and "over" not in line.lower() and "under" not in line.lower():
+            current_game = line
+            continue
+
+        # MONEYLINE leg: team name followed by "MONEYLINE" on next line
+        if i + 1 < len(lines) and lines[i + 1].strip().upper() == "MONEYLINE":
             legs.append({
-                "player": m.group(1).strip(),
-                "direction": _parse_direction(m.group(2)),
-                "line": float(m.group(3)),
-                "prop_type": _normalize_prop(m.group(4)),
-                "odds": _parse_odds(m.group(5)),
+                "player": line.strip(),  # team name
+                "direction": "moneyline",
+                "line": 0,
+                "prop_type": "moneyline",
+                "odds": current_odds,
                 "book": "FD",
+                "group": sgp_group,
+                "game": current_game,
             })
+            continue
+        if line.strip().upper() == "MONEYLINE":
+            continue
+
+        # ALL CAPS label line (e.g. "TATSUYA IMAI - ALT STRIKEOUTS") — skip
+        if line == line.upper() and len(line) > 5 and "-" in line:
+            continue
+
+        # Prop leg: "Player N+ PropType"
+        prop_m = _FD_PROP_LEG_RE.match(line)
+        if prop_m:
+            legs.append({
+                "player": prop_m.group(1).strip(),
+                "direction": "over",
+                "line": float(prop_m.group(2)),
+                "prop_type": _normalize_prop(prop_m.group(3)),
+                "odds": current_odds,
+                "book": "FD",
+                "group": sgp_group,
+                "game": current_game,
+            })
+            continue
+
+        # Prop leg: "Player Over/Under N.N PropType (odds)"
+        ou_m = _FD_OU_LEG_RE.match(line)
+        if ou_m:
+            legs.append({
+                "player": ou_m.group(1).strip(),
+                "direction": _parse_direction(ou_m.group(2)),
+                "line": float(ou_m.group(3)),
+                "prop_type": _normalize_prop(ou_m.group(4)),
+                "odds": _parse_odds(ou_m.group(5)) if ou_m.group(5) else current_odds,
+                "book": "FD",
+                "group": sgp_group,
+                "game": current_game,
+            })
+            continue
 
     if legs:
         return legs
@@ -238,44 +345,154 @@ def _try_fd(text: str) -> Optional[list[dict]]:
 
 # ── Fanatics ───────────────────────────────────────────────────────
 
-# Fanatics (formerly PointsBet) paste format varies, but common pattern:
-#   Player Name
-#   Over X.X Prop Type
-#   odds
-# or inline: "Player Name: Over X.X Points @ -110"
+# Real Fanatics paste format (from app share):
+#   Fanatics Sportsbook
+#   11 Leg SGP
+#   Wager $25.00
+#   Payout $371.88
+#   +1387
+#   ...
+#   4+                              ← line (4+ means over 4)
+#   Brandin Podziemski              ← player
+#   - Rebounds                      ← prop type
+#   Los Angeles Lakers at Golden    ← game (may wrap)
+#   State Warriors
+#   ...
+#   MUST BE 21+. GAMBLING PROBLEM?  ← footer
+
+# Threshold pattern: "4+" or "12+" or "0.5+" or "Under 3.5"
+_FAN_THRESHOLD_RE = re.compile(r"^(\d+\.?\d*)\+$")
+_FAN_UNDER_RE = re.compile(r"^(?:under|u)\s*(\d+\.?\d*)$", re.IGNORECASE)
+
+# Prop line: "- Rebounds" or "- Points" etc.
+_FAN_PROP_RE = re.compile(r"^-\s*(.+)$")
+
+# Overall odds in header: "+1387" or "-250"
+_FAN_PARLAY_ODDS_RE = re.compile(r"^[+-−–]\d{3,}$")
+
+# Lines to skip
+_FAN_SKIP = re.compile(
+    r"(?:fanatics|sportsbook|leg sgp|wager|payout|fcash|must be 21|gambling problem|call 1-800|"
+    r"rg$|betslip|share|placed|open|settled|won|lost|void)",
+    re.IGNORECASE,
+)
+
 
 def _try_fanatics(text: str) -> Optional[list[dict]]:
+    # Quick check: must contain "fanatics" or the N+ threshold pattern
+    if "fanatics" not in text.lower() and not re.search(r"^\d+\+$", text, re.MULTILINE):
+        return None
+
     lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    if not lines:
+        return None
+
+    # Extract overall parlay odds from header
+    parlay_odds = None
+    for line in lines[:10]:
+        if _FAN_PARLAY_ODDS_RE.match(line):
+            parlay_odds = _parse_odds(line)
+            break
+
+    # Parse legs by scanning for threshold → player → prop → game pattern
     legs = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
 
-    # Inline with @ separator: "Player: Over X.X PropType @ odds"
-    inline_re = re.compile(
-        r"^(.+?)\s*[:]\s*(over|under)\s+(\d+\.?\d*)\s+(.+?)\s*[@]\s*([+-−–]?\d+)",
-        re.IGNORECASE,
-    )
-    for line in lines:
-        m = inline_re.match(line)
-        if m:
-            legs.append({
-                "player": m.group(1).strip(),
-                "direction": _parse_direction(m.group(2)),
-                "line": float(m.group(3)),
-                "prop_type": _normalize_prop(m.group(4)),
-                "odds": _parse_odds(m.group(5)),
-                "book": "FAN",
-            })
+        # Skip header/footer lines
+        if _FAN_SKIP.search(line):
+            i += 1
+            continue
 
-    if legs:
-        return legs
+        # Check for threshold: "4+" or "12+"
+        threshold_m = _FAN_THRESHOLD_RE.match(line)
+        under_m = _FAN_UNDER_RE.match(line) if not threshold_m else None
 
-    # Fall back to DK-style block parser
-    result = _try_dk(text)
-    if result:
-        for leg in result:
-            leg["book"] = "FAN"
-        return result
+        if threshold_m or under_m:
+            if threshold_m:
+                line_val = float(threshold_m.group(1))
+                direction = "over"
+            else:
+                line_val = float(under_m.group(1))
+                direction = "under"
 
-    return None
+            # Next line should be player name
+            player = None
+            prop_type = None
+            if i + 1 < len(lines):
+                # Player name: could be "Brandin Podziemski" or
+                # "Brandin Podziemski\n- Rebounds" or "Brandin Podziemski - Rebounds"
+                next_line = lines[i + 1]
+                # Check if player + prop are on same line: "Player - PropType"
+                dash_split = re.match(r"^(.+?)\s*-\s*(points|rebounds|assists|steals|blocks|threes|3-pointers|strikeouts|hits|runs|total bases|home runs|touchdowns|goals|passing yards|rushing yards|receiving yards).*$", next_line, re.IGNORECASE)
+                if dash_split:
+                    player = dash_split.group(1).strip()
+                    prop_type = _normalize_prop(dash_split.group(2))
+                    i += 2
+                else:
+                    player = next_line.strip()
+                    i += 2
+                    # Look for prop on next line: "- Rebounds"
+                    if i < len(lines):
+                        prop_m = _FAN_PROP_RE.match(lines[i])
+                        if prop_m:
+                            prop_type = _normalize_prop(prop_m.group(1))
+                            i += 1
+
+                # Skip game lines (contain "at" or known team words)
+                while i < len(lines) and not _FAN_THRESHOLD_RE.match(lines[i]) and not _FAN_UNDER_RE.match(lines[i]):
+                    if _FAN_SKIP.search(lines[i]):
+                        i += 1
+                        break
+                    # Game lines: "Los Angeles Lakers at Golden" / "State Warriors"
+                    if " at " in lines[i] or _is_team_continuation(lines[i], lines[i-1] if i > 0 else ""):
+                        i += 1
+                        continue
+                    break
+
+            if player:
+                legs.append({
+                    "player": player,
+                    "direction": direction,
+                    "line": line_val,
+                    "prop_type": prop_type or "points",
+                    "odds": parlay_odds,
+                    "book": "FAN",
+                })
+            continue
+
+        i += 1
+
+    return legs if legs else None
+
+
+def _is_team_continuation(line: str, prev: str) -> bool:
+    """Heuristic: is this line a wrapped team name from the previous line?"""
+    # Common team name fragments that appear on wrapped lines
+    team_fragments = [
+        "warriors", "lakers", "celtics", "nets", "knicks", "bucks", "heat",
+        "76ers", "sixers", "suns", "nuggets", "clippers", "kings", "hawks",
+        "bulls", "cavaliers", "mavericks", "rockets", "pacers", "grizzlies",
+        "pelicans", "thunder", "magic", "pistons", "raptors", "jazz",
+        "timberwolves", "blazers", "trail blazers", "spurs", "hornets", "wizards",
+        "state warriors", "trail blazers",
+        # MLB
+        "yankees", "red sox", "dodgers", "mets", "cubs", "astros", "braves",
+        "padres", "phillies", "orioles", "rangers", "guardians", "twins",
+        "mariners", "rays", "blue jays", "white sox", "tigers", "royals",
+        "pirates", "reds", "brewers", "cardinals", "giants", "rockies",
+        "diamondbacks", "nationals", "marlins", "athletics",
+    ]
+    low = line.lower().strip()
+    if any(t in low for t in team_fragments):
+        return True
+    # If prev line ended with "at" + partial city, this is continuation
+    if prev.strip().endswith(("Golden", "Los Angeles", "San Antonio", "New York",
+                              "Oklahoma City", "San Francisco", "New Orleans",
+                              "Salt Lake", "Portland Trail")):
+        return True
+    return False
 
 
 # ── BetMGM ─────────────────────────────────────────────────────────
@@ -487,27 +704,42 @@ def format_confirmation(legs: list[dict], parlay: bool = False) -> str:
     if not legs:
         return "Could not parse any bets from that text."
 
+    # Group by SGP group
+    from collections import defaultdict
+    groups: dict[int, list] = defaultdict(list)
+    for leg in legs:
+        groups[leg.get("group", 0)].append(leg)
+
     lines = []
-    if parlay and len(legs) > 1:
+    n_bets = len(groups)
+    if n_bets > 1:
+        lines.append(f"🎯 Parsed {n_bets} SGP bet(s) ({len(legs)} total legs):")
+    elif len(legs) > 1:
         lines.append(f"🎯 Parsed {len(legs)}-leg parlay:")
     else:
-        lines.append(f"🎯 Parsed {len(legs)} bet(s):")
+        lines.append(f"🎯 Parsed 1 bet:")
 
-    lines.append("─────────────────")
-    for i, leg in enumerate(legs, 1):
-        player = leg.get("player") or "?"
-        prop = leg.get("prop_type") or "?"
-        direction = (leg.get("direction") or "?").upper()
-        line_val = leg.get("line")
-        odds = leg.get("odds")
-        book = leg.get("book") or "?"
+    for gid, group_legs in sorted(groups.items()):
+        if n_bets > 1:
+            odds = group_legs[0].get("odds")
+            odds_str = f" ({odds:+d})" if odds is not None else ""
+            game = group_legs[0].get("game") or ""
+            lines.append(f"─────────────────")
+            lines.append(f"SGP {gid}{odds_str}: {game}")
+        else:
+            lines.append("─────────────────")
 
-        line_str = f"{line_val}" if line_val is not None else "?"
-        odds_str = f"{odds:+d}" if odds is not None else "?"
+        for i, leg in enumerate(group_legs, 1):
+            player = leg.get("player") or "?"
+            prop = leg.get("prop_type") or "?"
+            direction = (leg.get("direction") or "?").upper()
+            line_val = leg.get("line")
 
-        prefix = f"  Leg {i}: " if len(legs) > 1 else "  "
-        lines.append(f"{prefix}{player}")
-        lines.append(f"    {prop.title()} {direction} {line_str} ({odds_str}) [{book}]")
+            line_str = f"{line_val}" if line_val is not None else ""
+            if prop == "moneyline":
+                lines.append(f"  {player} ML")
+            else:
+                lines.append(f"  {player} {prop.title()} {direction} {line_str}")
 
     lines.append("─────────────────")
     lines.append("Reply: ✅ Yes  |  ✏️ Edit  |  ❌ Cancel")

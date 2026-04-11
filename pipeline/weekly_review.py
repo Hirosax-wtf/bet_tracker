@@ -151,7 +151,23 @@ async def run_weekly_review_async(anchor: date | None = None) -> int:
 
 def run_weekly_review(anchor: date | None = None) -> int:
     """Sync wrapper for APScheduler."""
-    return asyncio.run(run_weekly_review_async(anchor))
+    result = asyncio.run(run_weekly_review_async(anchor))
+
+    # --- shared_grading: import resolved bets + generate bet_tracker review ---
+    try:
+        import sys as _sg_sys, os as _sg_os
+        _sg_sys.path.insert(0, _sg_os.path.expanduser("~"))
+        from shared_grading.adapters.bet_tracker_adapter import import_resolved_bets
+        from shared_grading.review.report_generator import generate_bot_review
+        import_resolved_bets()
+        review = generate_bot_review("bet_tracker")
+        log.info("shared_grading bet_tracker review: %d picks, hit_rate=%s",
+                 review.get("summary", {}).get("total_picks", 0),
+                 review.get("summary", {}).get("hit_rate"))
+    except Exception as _sg_err:
+        log.debug("shared_grading review failed (non-fatal): %s", _sg_err)
+
+    return result
 
 
 if __name__ == "__main__":

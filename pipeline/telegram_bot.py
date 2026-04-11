@@ -965,24 +965,67 @@ async def slip_stake(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     prob = ctx.user_data.get("slip_prob", 50)
     legs = ctx.user_data.get("slip_legs", [])
 
-    msgs = []
+    # Group legs by SGP group (if present). Each group = one bet.
+    from collections import defaultdict
+    groups: dict[int, list] = defaultdict(list)
     for leg in legs:
-        bet = {
-            "sport": "NBA",  # default, user can fix via /close
-            "game": "?",
-            "game_date": date.today().isoformat(),
-            "player": leg.get("player"),
-            "prop_type": leg.get("prop_type"),
-            "line": leg.get("line"),
-            "direction": leg.get("direction"),
-            "book": leg.get("book", "?"),
-            "odds": leg.get("odds") or -110,
-            "your_prob": prob,
-            "stake": stake,
-            "niche": None,
-            "injury_context": None,
-            "notes": "logged via /slip",
-        }
+        g = leg.get("group", 0)
+        groups[g].append(leg)
+
+    msgs = []
+    for group_id, group_legs in sorted(groups.items()):
+        if len(group_legs) == 1 and group_legs[0].get("prop_type") != "moneyline":
+            # Single-leg bet
+            leg = group_legs[0]
+            bet = {
+                "sport": _detect_sport(leg),
+                "game": leg.get("game") or "?",
+                "game_date": date.today().isoformat(),
+                "player": leg.get("player"),
+                "prop_type": leg.get("prop_type"),
+                "line": leg.get("line"),
+                "direction": leg.get("direction"),
+                "book": leg.get("book", "?"),
+                "odds": leg.get("odds") or -110,
+                "your_prob": prob,
+                "stake": stake,
+                "niche": None,
+                "injury_context": None,
+                "notes": "logged via /slip",
+            }
+        else:
+            # Multi-leg SGP → one bet row with legs summarized
+            leg_descs = []
+            for l in group_legs:
+                if l.get("prop_type") == "moneyline":
+                    leg_descs.append(f"{l['player']} ML")
+                else:
+                    leg_descs.append(
+                        f"{l['player']} {l.get('prop_type','?')} "
+                        f"{l.get('direction','').upper()} {l.get('line','?')}"
+                    )
+            summary_player = " + ".join(leg_descs)
+            # Truncate if too long
+            if len(summary_player) > 200:
+                summary_player = summary_player[:197] + "..."
+            first = group_legs[0]
+            bet = {
+                "sport": _detect_sport(first),
+                "game": first.get("game") or "?",
+                "game_date": date.today().isoformat(),
+                "player": summary_player,
+                "prop_type": "sgp",
+                "line": None,
+                "direction": "parlay",
+                "book": first.get("book", "?"),
+                "odds": first.get("odds") or -110,
+                "your_prob": prob,
+                "stake": stake,
+                "niche": None,
+                "injury_context": None,
+                "notes": f"{len(group_legs)}-leg SGP via /slip",
+            }
+
         bet_id, summary = _save_bet(user, bet)
         awards = check_and_award(db, user["user_id"], "log")
         if awards:
@@ -994,6 +1037,23 @@ async def slip_stake(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data.pop("slip_legs", None)
     ctx.user_data.pop("slip_prob", None)
     return ConversationHandler.END
+
+
+def _detect_sport(leg: dict) -> str:
+    """Guess sport from team/player names in the leg."""
+    game = (leg.get("game") or "").lower()
+    prop = (leg.get("prop_type") or "").lower()
+    if prop in ("strikeouts", "hits", "runs", "rbis", "total_bases", "home_runs"):
+        return "MLB"
+    if prop in ("points", "rebounds", "assists", "threes", "blocks", "steals"):
+        return "NBA"
+    # Check team names in game string
+    mlb_teams = ["astros", "mariners", "yankees", "dodgers", "mets", "cubs", "red sox",
+                 "braves", "padres", "phillies", "orioles", "rangers", "marlins",
+                 "tigers", "cardinals", "rays", "blue jays", "twins", "guardians"]
+    if any(t in game for t in mlb_teams):
+        return "MLB"
+    return "NBA"
 
 
 # ---------------------------------------------------------------------------
@@ -1075,6 +1135,16 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("group", cmd_group))
     app.add_handler(CommandHandler("template", cmd_template))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+
+    # Catch-all: log any unhandled message so we can debug
+    async def _fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        user_name = (update.effective_user.first_name if update.effective_user else "?")
+        text = (update.message.text[:80] if update.message and update.message.text else "(no text)")
+        log.warning("UNHANDLED message from %s: %s", user_name, text)
+        await update.message.reply_text(
+            "I didn't understand that. Try /start, /bet, /slip, or /help"
+        )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _fallback))
 
     return app
 
