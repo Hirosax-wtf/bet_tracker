@@ -397,12 +397,39 @@ def _try_fanatics(text: str) -> Optional[list[dict]]:
     # Parse legs by scanning for threshold → player → prop → game pattern
     legs = []
     i = 0
+
+    # Spread pattern: "Team +/-X.X" followed by "Spread"
+    _spread_re = re.compile(r"^(.+?)\s+([+-]\d+\.?\d*)$")
+
     while i < len(lines):
         line = lines[i]
 
         # Skip header/footer lines
         if _FAN_SKIP.search(line):
             i += 1
+            continue
+        # Skip money lines, multipliers, standalone odds
+        if re.match(r"^[\$\-]?\$?[\d,.]+$", line) or re.match(r"^\d+[Xx]$", line):
+            i += 1
+            continue
+
+        # ── Spread leg: "Team +9.5" followed by "Spread" ──
+        spread_m = _spread_re.match(line)
+        if spread_m and i + 1 < len(lines) and lines[i + 1].strip().lower() == "spread":
+            team_name = spread_m.group(1).strip()
+            spread_val = float(spread_m.group(2))
+            legs.append({
+                "player": team_name,
+                "direction": "spread",
+                "line": spread_val,
+                "prop_type": "spread",
+                "odds": parlay_odds,
+                "book": "FAN",
+            })
+            i += 2
+            # Skip game lines after spread
+            while i < len(lines) and (" at " in lines[i] or _is_team_continuation(lines[i], lines[i-1] if i > 0 else "")):
+                i += 1
             continue
 
         # Check for threshold: "4+" or "12+"
@@ -417,36 +444,54 @@ def _try_fanatics(text: str) -> Optional[list[dict]]:
                 line_val = float(under_m.group(1))
                 direction = "under"
 
-            # Next line should be player name
+            # Next line should be player name (or "Total Points" for game total)
             player = None
             prop_type = None
             if i + 1 < len(lines):
-                # Player name: could be "Brandin Podziemski" or
-                # "Brandin Podziemski\n- Rebounds" or "Brandin Podziemski - Rebounds"
                 next_line = lines[i + 1]
-                # Check if player + prop are on same line: "Player - PropType"
-                dash_split = re.match(r"^(.+?)\s*-\s*(points|rebounds|assists|steals|blocks|threes|3-pointers|strikeouts|hits|runs|total bases|home runs|touchdowns|goals|passing yards|rushing yards|receiving yards).*$", next_line, re.IGNORECASE)
-                if dash_split:
-                    player = dash_split.group(1).strip()
-                    prop_type = _normalize_prop(dash_split.group(2))
+
+                # Game total: "Under 229.5" → "Total Points" (not a player prop)
+                if next_line.strip().lower() in ("total points", "total", "game total"):
+                    player = "Game Total"
+                    prop_type = "total"
                     i += 2
+                # Player + prop on same line: "LeBron James - Assists"
+                # Also handle wrapped game text: "Jake Laravia - Points Phoenix Suns at Los"
                 else:
-                    player = next_line.strip()
-                    i += 2
-                    # Look for prop on next line: "- Rebounds"
-                    if i < len(lines):
-                        prop_m = _FAN_PROP_RE.match(lines[i])
-                        if prop_m:
-                            prop_type = _normalize_prop(prop_m.group(1))
-                            i += 1
+                    dash_split = re.match(
+                        r"^(.+?)\s*-\s*(points|rebounds|assists|steals|blocks|threes|"
+                        r"3-pointers|strikeouts|hits|runs|total bases|home runs|"
+                        r"touchdowns|goals|passing yards|rushing yards|receiving yards)"
+                        r"(?:\s.*)?$",
+                        next_line, re.IGNORECASE,
+                    )
+                    if dash_split:
+                        player = dash_split.group(1).strip()
+                        prop_type = _normalize_prop(dash_split.group(2))
+                        i += 2
+                    else:
+                        player = next_line.strip()
+                        i += 2
+                        # Look for prop on next line: "- Rebounds"
+                        if i < len(lines):
+                            prop_m = _FAN_PROP_RE.match(lines[i])
+                            if prop_m:
+                                prop_type = _normalize_prop(prop_m.group(1))
+                                i += 1
 
                 # Skip game lines (contain "at" or known team words)
-                while i < len(lines) and not _FAN_THRESHOLD_RE.match(lines[i]) and not _FAN_UNDER_RE.match(lines[i]):
-                    if _FAN_SKIP.search(lines[i]):
+                while i < len(lines):
+                    cur = lines[i]
+                    # Stop at next leg indicator
+                    if _FAN_THRESHOLD_RE.match(cur) or _FAN_UNDER_RE.match(cur):
+                        break
+                    if _spread_re.match(cur) and i + 1 < len(lines) and lines[i+1].strip().lower() == "spread":
+                        break
+                    if _FAN_SKIP.search(cur):
                         i += 1
                         break
-                    # Game lines: "Los Angeles Lakers at Golden" / "State Warriors"
-                    if " at " in lines[i] or _is_team_continuation(lines[i], lines[i-1] if i > 0 else ""):
+                    # Game lines: "Phoenix Suns at Los" / "Angeles Lakers"
+                    if " at " in cur or _is_team_continuation(cur, lines[i-1] if i > 0 else ""):
                         i += 1
                         continue
                     break
@@ -833,6 +878,11 @@ def format_confirmation(legs: list[dict], parlay: bool = False) -> str:
             line_str = f"{line_val}" if line_val is not None else ""
             if prop == "moneyline":
                 lines.append(f"  {player} ML")
+            elif prop == "spread":
+                sign = "+" if line_val and line_val > 0 else ""
+                lines.append(f"  {player} {sign}{line_str}")
+            elif prop == "total":
+                lines.append(f"  {player} {direction} {line_str}")
             else:
                 lines.append(f"  {player} {prop.title()} {direction} {line_str}")
 
