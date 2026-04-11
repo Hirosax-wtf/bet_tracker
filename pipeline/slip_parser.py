@@ -255,16 +255,32 @@ def _try_fd(text: str) -> Optional[list[dict]]:
     current_game = None
     sgp_group = 0  # increments on each new SGP block
 
-    for i, line in enumerate(lines):
+    # Two-line prop: "TO SCORE N+ PROP" or "N+ PROP" (e.g. "1+ MADE THREES")
+    _to_score_re = re.compile(
+        r"^(?:to score\s+)?(\d+\.?\d*)\+\s+(.+)$", re.IGNORECASE,
+    )
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
         # New SGP block
         if line.strip().upper() == "SGP" or "same game parlay" in line.lower():
             sgp_group += 1
+            i += 1
             continue
 
         # Skip boilerplate
-        if _FD_TIME_RE.match(line):
+        if _FD_TIME_RE.match(line) or _fd_skip(line):
+            i += 1
             continue
-        if _fd_skip(line):
+
+        # Skip single chars, arrows, symbols, Japanese chars, money amounts
+        if len(line) <= 2 or re.match(r"^[\$\d,.]+$", line) or re.match(r"^\d+ leg", line, re.I):
+            i += 1
+            continue
+        if re.match(r"^(?:includes:|[X>へ<→←]$)", line, re.I):
+            i += 1
             continue
 
         # SGP odds line
@@ -272,18 +288,25 @@ def _try_fd(text: str) -> Optional[list[dict]]:
             current_odds = _parse_odds(line)
             if sgp_group == 0:
                 sgp_group = 1
+            i += 1
             continue
 
-        # Game line — extract for context
+        # Date line: "APR 8, 9:43PM ET"
+        if re.match(r"^[A-Z]{3}\s+\d", line):
+            i += 1
+            continue
+
+        # Game line — "Team @ Team" or "Team at Team"
         game_m = _FD_GAME_RE.match(line)
-        if game_m and "+" not in line and "over" not in line.lower() and "under" not in line.lower():
+        if game_m and "+" not in line and "over" not in line.lower() and "under" not in line.lower() and "score" not in line.lower():
             current_game = line
+            i += 1
             continue
 
         # MONEYLINE leg: team name followed by "MONEYLINE" on next line
         if i + 1 < len(lines) and lines[i + 1].strip().upper() == "MONEYLINE":
             legs.append({
-                "player": line.strip(),  # team name
+                "player": line.strip(),
                 "direction": "moneyline",
                 "line": 0,
                 "prop_type": "moneyline",
@@ -292,15 +315,46 @@ def _try_fd(text: str) -> Optional[list[dict]]:
                 "group": sgp_group,
                 "game": current_game,
             })
+            i += 2  # skip both the team name and "MONEYLINE"
             continue
         if line.strip().upper() == "MONEYLINE":
+            i += 1
             continue
 
-        # ALL CAPS label line (e.g. "TATSUYA IMAI - ALT STRIKEOUTS") — skip
+        # ALL CAPS label line (e.g. "DONOVAN CLINGAN - POINTS") — skip
         if line == line.upper() and len(line) > 5 and "-" in line:
+            i += 1
             continue
 
-        # Prop leg: "Player N+ PropType"
+        # ── Two-line pattern: Player Name → "TO SCORE N+ PROP" or "N+ PROP" ──
+        if i + 1 < len(lines):
+            next_line = lines[i + 1]
+            ts_m = _to_score_re.match(next_line)
+            if ts_m:
+                # This line is the player, next line is the prop
+                player = line.strip()
+                line_val = float(ts_m.group(1))
+                prop_raw = ts_m.group(2).strip()
+                # Clean: "MADE THREES" → "threes", "POINTS" → "points"
+                prop_raw = re.sub(r"^made\s+", "", prop_raw, flags=re.I)
+                prop_type = _normalize_prop(prop_raw)
+                legs.append({
+                    "player": player,
+                    "direction": "over",
+                    "line": line_val,
+                    "prop_type": prop_type,
+                    "odds": current_odds,
+                    "book": "FD",
+                    "group": sgp_group,
+                    "game": current_game,
+                })
+                i += 2
+                # Skip the ALL-CAPS label line if present (e.g. "DONOVAN CLINGAN - POINTS")
+                if i < len(lines) and lines[i] == lines[i].upper() and "-" in lines[i]:
+                    i += 1
+                continue
+
+        # Single-line: "Player N+ PropType" (e.g. "Tatsuya Imai 5+ Strikeouts")
         prop_m = _FD_PROP_LEG_RE.match(line)
         if prop_m:
             legs.append({
@@ -313,22 +367,65 @@ def _try_fd(text: str) -> Optional[list[dict]]:
                 "group": sgp_group,
                 "game": current_game,
             })
+            i += 1
             continue
 
-        # Prop leg: "Player Over/Under N.N PropType (odds)"
+        # Single-line: "Player Over/Under N.N" WITHOUT prop type on line
+        # e.g. "Donovan Clingan Under 15.5" followed by "DONOVAN CLINGAN - POINTS"
+        _bare_ou_re = re.compile(r"^(.+?)\s+(over|under)\s+(\d+\.?\d*)\s*$", re.IGNORECASE)
+        bare_m = _bare_ou_re.match(line)
+        if bare_m:
+            player = bare_m.group(1).strip()
+            direction = _parse_direction(bare_m.group(2))
+            line_val = float(bare_m.group(3))
+            prop_type = "points"  # default
+            # Check ALL-CAPS label on next line for prop: "DONOVAN CLINGAN - POINTS"
+            if i + 1 < len(lines):
+                label = lines[i + 1]
+                if label == label.upper() and "-" in label:
+                    label_prop = label.split("-")[-1].strip()
+                    prop_type = _normalize_prop(label_prop)
+                    i += 1  # skip the label
+            legs.append({
+                "player": player,
+                "direction": direction,
+                "line": line_val,
+                "prop_type": prop_type,
+                "odds": current_odds,
+                "book": "FD",
+                "group": sgp_group,
+                "game": current_game,
+            })
+            i += 1
+            continue
+
+        # Single-line: "Player Over/Under N.N PropType (odds)"
         ou_m = _FD_OU_LEG_RE.match(line)
         if ou_m:
+            prop_raw = ou_m.group(4).strip() if ou_m.group(4) else ""
+            prop_type = _normalize_prop(prop_raw) if prop_raw else None
+            # If prop is missing or looks wrong, check ALL-CAPS label on next line
+            # e.g. "Donovan Clingan Under 15.5" → "DONOVAN CLINGAN - POINTS"
+            if (not prop_type or prop_type == prop_raw.lower()) and i + 1 < len(lines):
+                label = lines[i + 1]
+                if label == label.upper() and "-" in label:
+                    label_prop = label.split("-")[-1].strip()
+                    prop_type = _normalize_prop(label_prop)
+                    i += 1  # skip the label line
             legs.append({
                 "player": ou_m.group(1).strip(),
                 "direction": _parse_direction(ou_m.group(2)),
                 "line": float(ou_m.group(3)),
-                "prop_type": _normalize_prop(ou_m.group(4)),
+                "prop_type": prop_type or "points",
                 "odds": _parse_odds(ou_m.group(5)) if ou_m.group(5) else current_odds,
                 "book": "FD",
                 "group": sgp_group,
                 "game": current_game,
             })
+            i += 1
             continue
+
+        i += 1
 
     if legs:
         return legs
@@ -827,10 +924,16 @@ def _merge_generic_extras(primary: list[dict], text: str, book: str) -> list[dic
     # Build set of players already parsed (lowercase for matching)
     existing_players = {leg["player"].lower().strip() for leg in primary}
 
+    # Reject generic legs with garbage player names
+    _garbage_names = {"to score", "total wager", "sgp", "same game parlay",
+                      "moneyline", "spread", ">", "x", ""}
+
     extras = []
     for leg in generic:
         player_low = leg["player"].lower().strip()
-        # Only add if this player isn't already in primary results
+        # Skip garbage names and players already in primary results
+        if player_low in _garbage_names or len(player_low) <= 2:
+            continue
         if player_low not in existing_players:
             leg["book"] = book
             extras.append(leg)
