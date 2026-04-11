@@ -58,7 +58,7 @@ USE_REMOTE_DB: bool = bool(BET_TRACKER_GIST_ID) and BET_TRACKER_GIST_ID != "PAST
 
 # --- Misc -------------------------------------------------------------------
 DEFAULT_BANKROLL: float = 1000.0
-LEADERBOARD_MIN_BETS: int = 20
+LEADERBOARD_MIN_BETS: int = 1
 
 
 def require_github_token() -> str:
